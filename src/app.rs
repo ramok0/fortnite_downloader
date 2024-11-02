@@ -1,7 +1,7 @@
-use std::{collections::HashMap, fmt::format, hash::Hash, path::PathBuf, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex}};
+use std::{collections::HashMap, fmt::format, hash::Hash, io::Write, path::PathBuf, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex}};
 
 use eframe::App;
-use egui::{RichText, Spinner, TextEdit, Widget};
+use egui::{Color32, RichText, Spinner, TextEdit, Widget};
 use epic_manifest_parser_rs::{manifest::{chunk_info::FChunkInfo, file_manifest::FFileManifest, FManifest}, ParseResult};
 
 use crate::{downloader::DownloadManager, epic, get_client, launcher};
@@ -13,6 +13,7 @@ pub struct Application {
     download_tags: HashMap<String, bool>,
     manifest: Option<FManifest>,
     max_threads: usize,
+    max_retries: usize,
     max_chunk_concurrency: usize,
     download_path: Option<PathBuf>,
     error: Option<Box<dyn std::error::Error>>,
@@ -25,11 +26,13 @@ pub struct Application {
     correct_files: Arc<Mutex<Vec<FFileManifest>>>,
     ignore_corrupted_files: bool,
     manifest_communication: (tokio::sync::mpsc::Sender<ParseResult<FManifest>>, tokio::sync::mpsc::Receiver<ParseResult<FManifest>>),
+    error_communication: (tokio::sync::mpsc::Sender<String>, tokio::sync::mpsc::Receiver<String>),
 }
 
 impl Default for Application {
     fn default() -> Self {
         Self {
+            max_retries: 3,
             ignore_corrupted_files: false,
             tags: None,
             download_tags: HashMap::new(),
@@ -46,6 +49,7 @@ impl Default for Application {
             checking_integrity: Arc::new(AtomicBool::new(false)),
             correct_files: Arc::new(Mutex::new(Vec::new())),
             manifest_communication: tokio::sync::mpsc::channel(1),
+            error_communication: tokio::sync::mpsc::channel(3),
         }
     }
 }
@@ -65,8 +69,6 @@ impl Application {
             self.files_number = files_number;
 
             return Some((files_number,file_size));
-        
-
     }
 
     fn get_filtered_files(&self) -> Vec<FFileManifest> {
@@ -97,6 +99,11 @@ impl eframe::App for Application {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
 
+        //error_communication
+        if let Ok(error) = self.error_communication.1.try_recv() {
+            self.error = Some(error.into());
+        }
+
         if let Ok(manifest_result) = self.manifest_communication.1.try_recv() {
             match manifest_result {
                 Ok(manifest) => {
@@ -126,7 +133,7 @@ impl eframe::App for Application {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(error) = &self.error {
-                ui.label(format!("Error: {}", error));
+                ui.colored_label(Color32::RED, format!("Error: {}", error));
             }
 
             let download_manager = {
@@ -199,6 +206,10 @@ impl eframe::App for Application {
     
                         ui.separator();
     
+                        ui.horizontal(|ui| {
+                            ui.label("Max Retries : ");
+                            ui.add(egui::Slider::new(&mut self.max_retries, 0..=5).text("threads"));
+                        });
                         
                         if let Some(download_path) = &self.download_path {
                             ui.label(format!("Download path: {}", download_path.to_string_lossy()));
@@ -339,6 +350,7 @@ impl eframe::App for Application {
                                 Ok(mut remember_me_data ) => {
 
                                     let tx: tokio::sync::mpsc::Sender<Result<FManifest, epic_manifest_parser_rs::error::ParseError>> = self.manifest_communication.0.clone();
+                                   let err_tx = self.error_communication.0.clone();
                                     tokio::spawn(async move {
                                         if let Ok(launcher_token) = epic::token(
                                             epic::Token::RefreshToken(&remember_me_data.token),
@@ -355,11 +367,27 @@ impl eframe::App for Application {
 
                                             if let Ok(manifest_response) = launcher_token.get_manifest().await {
                                                 if let Some(manifest_uri) = manifest_response.get_first_manifest() {
-                                                    if let Ok(response) = reqwest::get(&manifest_uri).await {
-                                                        let bytes = response.bytes().await.unwrap().to_vec();
-                                                        
-                                                        let mut parser = epic_manifest_parser_rs::manifest::FManifestParser::new(&bytes);
-                                                        let _ = tx.send(parser.parse()).await;
+                                                    dbg!(&manifest_uri);
+
+                                                    let client = reqwest::Client::new();
+                                                    let request = client.get(&manifest_uri).header("Accept", "application/text;text/plain;application/octet-stream");
+
+                                                    if let Ok(response) = request.send().await {
+                                                        dbg!(response.status());
+
+                                                        if response.status() == 200 {
+                                                            let bytes = response.bytes().await.unwrap().to_vec();
+                                                            dbg!(bytes.len());
+                                                            
+                                                            let parser = epic_manifest_parser_rs::manifest::FManifestParser::new(&bytes);
+                                                            let _ = tx.send(parser.parse()).await;
+                                                        } else {
+                                                            if let Ok(error) = response.text().await {
+                                                                let _ = err_tx.send(error).await;
+                                                            }   
+                                                        }
+
+
                                                     }
                                                 }
                                             }
