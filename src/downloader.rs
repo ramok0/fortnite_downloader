@@ -27,6 +27,12 @@ pub struct DownloadManager {
     pub ctx:egui::Context
 }
 
+struct DownloadedChunkResult {
+    data:Vec<u8>,
+    file_offset:usize,
+    hash:FSHAHash
+}
+
 impl DownloadManager {
     pub fn new(max_threads: usize, max_chunk_concurrency:usize, file_list: Vec<FFileManifest>, chunks_list: Vec<FChunkInfo>, ignore_corrupted_files:bool, ctx:egui::Context) -> Self {
 
@@ -106,25 +112,18 @@ impl DownloadManager {
                         let path = out_path.join(file_manifest.filename());
 
                         if path.exists() {
-                            let data = std::fs::read(&path).unwrap();                            
+                            let file_size = std::fs::metadata(&path).unwrap();
 
-                            if !ignore_corrupted_files && data.len() != file_manifest.file_size() as usize {
+                            if file_size.len() == file_manifest.file_size() as u64 {
+                                let mut progress = progress.write().unwrap();
+                                println!("thread #{} wrote progress", i);
+                                progress.downloaded_files_number += 1;
+                                progress.downloaded_bytes += file_manifest.file_size() as usize;
+                                continue;
+                            } else if !ignore_corrupted_files {
                                 std::fs::remove_file(&path).unwrap();
-                                println!("File {} is corrupted so it has been deleted.", file_manifest.filename());
-                            } else {
-                                if ignore_corrupted_files || crate::helper::check_hash(&data, file_manifest.sha_hash()) {
-                                    let mut progress = progress.write().unwrap();
-                                    println!("thread #{} wrote progress", i);
-                                    progress.downloaded_files_number += 1;
-                                    progress.downloaded_bytes += data.len();
-                                    ctx.request_repaint();
-                                    
-                                    continue;
-                                } else {
-                                    std::fs::remove_file(&path).unwrap();
     
-                                    println!("File {} is corrupted so it has been deleted.", file_manifest.filename());
-                                }
+                                println!("File {} is corrupted so it has been deleted.", file_manifest.filename());
                             }
                         }
 
@@ -133,26 +132,22 @@ impl DownloadManager {
 
                         
                         //create the temporary buffer to store the file data
-                        let mut buffer:Vec<u8> = Vec::<u8>::with_capacity(file_manifest.file_size() as usize);
+                        //let mut buffer:Vec<u8> = Vec::<u8>::with_capacity(file_manifest.file_size() as usize);
 
-                        unsafe {
+ /*                       unsafe {
                             //set the buffer length to the file size so we can write to it
                             buffer.set_len(file_manifest.file_size() as usize);
-                        }
+                        } */
                         
                         let file_manifest = file_manifest.clone();
                         let parts:Vec<FChunkPart> = file_manifest.chunk_parts().to_vec();
                         //number of handles of downloads for the file
-                        let mut handles: Vec<JoinHandle<Option<(Vec<u8>, usize)>>>      = Vec::new();
-
-
-
+                        let mut handles: Vec<JoinHandle<Option<DownloadedChunkResult>>>      = Vec::with_capacity(parts.len());
                       //  let downloaded_chunks = Arc::new(Mutex::new(Vec::<FChunkInfo>::new()));
                       let atomic_number = Arc::new(AtomicU64::new(0));
-
                         let parts_num = parts.len();
 
-                        for chunk_id in 0..parts_num {
+                        for chunk_id in 0..parts.len() {
                             let chunk_part = parts[chunk_id].clone();
 
                             let chunk_list = chunks_list.clone();
@@ -168,7 +163,7 @@ impl DownloadManager {
                                 let permit = semaphore.acquire().await.expect("Failed to acquire semaphore");
                          //       println!("Started new download");
                                 let chunk = chunk_list.iter().find(|x| x.guid() == chunk_part.guid()).unwrap();
-
+                                
                                 let chunk_data = DownloadManager::download_chunk(client.clone(), chunk.clone(), base_url).await?;
                                 let downloaded_chunks_num = atomic_number.load(std::sync::atomic::Ordering::Relaxed);
                             //    println!("Thread #{} downloaded chunk {} ({}/{}) downloaded file : {}", i, chunk.guid().to_string(), downloaded_chunks_num, file_manifest.chunk_parts().len(), file_manifest.filename());
@@ -195,24 +190,44 @@ impl DownloadManager {
                                     ctx.request_repaint();
                                 }
 
-                                return Some((part_data.to_vec(), chunk_part.file_offset() as usize));
+
+
+                                return Some( DownloadedChunkResult {
+                                    data:part_data.to_vec(), 
+                                    file_offset:chunk_part.file_offset() as usize,
+                                    hash:chunk.sha_hash().clone()
+                                });
                             });
 
                             {
                                 handles.push(handle);
                             }
                         }
+
+                        let mut has_failed = false;
                         
                         {
+                            let mut file = File::options().write(true).truncate(true).create(true).open(&path).unwrap();
+                            if let Err(e) =file.set_len(file_manifest.file_size() as u64) {
+                                eprintln!("Failed to set file length : {}", e);
+                                break;
+                            }
+
                             for handle in handles {
-                                if let Some((data, file_offset)) = handle.await.unwrap() {
-                                        //write the data to the buffer
-                                        buffer[file_offset..file_offset + data.len()].copy_from_slice(&data);
+                                match handle.await.unwrap() {
+                                    Some(downloaded_chunk) => {
+                                        println!("Thread #{} downloaded chunk successfully", i);
 
+                                        file.seek(std::io::SeekFrom::Start(downloaded_chunk.file_offset as u64)).unwrap();
+                                        file.write_all(&downloaded_chunk.data).unwrap();
+                                        file.flush().unwrap();
 
-                                } else {
-                                    println!("Failed to download file {}", file_manifest.filename());
-                                    progress.write().unwrap().failed_files_number += 1;
+                                    },
+                                    None => {
+                                        println!("Failed to download file {}", file_manifest.filename());
+                                        progress.write().unwrap().failed_files_number += 1;
+                                        has_failed = true;
+                                    }
                                 }
                             }
 
@@ -225,16 +240,22 @@ impl DownloadManager {
                         }
 
                         //check if the file is corrupted and then write the data to the file
-                        if ignore_corrupted_files || crate::helper::check_hash(&buffer, file_manifest.sha_hash()) {
+/*                        if ignore_corrupted_files || crate::helper::check_hash(&buffer, file_manifest.sha_hash()) {
                             let mut file = File::options().write(true).truncate(true).create(true).open(&path).unwrap();
                             file.write_all(&buffer).unwrap();
-                            let mut progress = progress.write().unwrap();
-                            progress.downloaded_files_number += 1;
-                            println!("{} downloaded successfully", file_manifest.filename());
+
                         } else {
                             println!("File {} is corrupted", file_manifest.filename());
                             progress.write().unwrap().failed_files_number += 1;
+                        } */
+
+                        if !has_failed {
+                            let mut progress = progress.write().unwrap();
+                            progress.downloaded_files_number += 1;
+                            println!("{} downloaded successfully", file_manifest.filename());
                         }
+
+
 
 
                     } else {
