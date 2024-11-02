@@ -1,0 +1,15 @@
+[package]
+name = "fortnite_downloader"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+eframe = "0.26.2"
+egui = "0.26.2"
+epic_manifest_parser_rs = {path = "D:/dev/epic_manifest_parser_rs"}
+reqwest = { version = "0.11.24", features = ["stream"] }
+rfd = "0.14.0"
+sha1 = "0.10.6"
+tokio = { version = "1.36.0", features = ["full"] }
