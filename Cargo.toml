@@ -6,10 +6,26 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-eframe = "0.26.2"
-egui = "0.26.2"
+aes = "0.8.4"
+base64 = "0.22.1"
+eframe = "0.29.1"
+egui = "0.29.1"
 epic_manifest_parser_rs = {path = "D:/dev/epic_manifest_parser_rs"}
-reqwest = { version = "0.11.24", features = ["stream"] }
-rfd = "0.14.0"
+lazy_static = "1.5.0"
+reqwest = { version = "0.12.9", features = ["json", "stream"] }
+rfd = "0.15.0"
+serde = { version = "1.0.214", features = ["derive"] }
+serde_json = "1.0.132"
 sha1 = "0.10.6"
 tokio = { version = "1.36.0", features = ["full"] }
+rust-ini = "0.21.1"
+
+[dependencies.windows]
+version = "0.58.0"
+features = [
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_Security_Cryptography",
+    "Win32_Security",
+]

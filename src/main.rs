@@ -1,15 +1,23 @@
 
+use std::process::Command;
+
 use app::Application;
 use epic_manifest_parser_rs::manifest::chunk_info::FChunkInfo;
 use epic_manifest_parser_rs::manifest::chunk_part::FChunkPart;
 use epic_manifest_parser_rs::manifest::file_manifest::FFileManifest;
 use epic_manifest_parser_rs::manifest::FManifestParser;
 use epic_manifest_parser_rs::reader::ByteReader;
+use launcher::get_decryption_keys;
 
 
 pub mod downloader;
 pub mod app;
 pub mod helper;
+pub mod launcher;
+pub mod decrypt;
+pub mod epic;
+pub mod epic_clients;
+pub mod epic_manifest_api;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>>{
@@ -77,19 +85,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>>{
     //     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     // }
 
+    get_decryption_keys().await;
+
+
+    //kill process epicgameslauncher.exe
+
+    Command::new("taskkill").args(&["/F", "/IM", "epicgameslauncher.exe"]).spawn().expect("failed to execute process");
+
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([800.0, 600.0]),
         ..Default::default()
     };
 
-    eframe::run_native(
+    let _ = eframe::run_native(
         "Fortnite Downloader",
         options,
         Box::new(|cc| {
             // This gives us image support:
            // egui_extras::install_image_loaders(&cc.egui_ctx);
 
-            Box::<Application>::default()
+            Ok(Box::<Application>::default())
         }),
     );
 

@@ -2,9 +2,9 @@ use std::{collections::HashMap, fmt::format, hash::Hash, path::PathBuf, sync::{a
 
 use eframe::App;
 use egui::{RichText, Spinner, TextEdit, Widget};
-use epic_manifest_parser_rs::manifest::{chunk_info::FChunkInfo, file_manifest::FFileManifest, FManifest};
+use epic_manifest_parser_rs::{manifest::{chunk_info::FChunkInfo, file_manifest::FFileManifest, FManifest}, ParseResult};
 
-use crate::downloader::DownloadManager;
+use crate::{downloader::DownloadManager, epic, get_client, launcher};
 
 
 
@@ -23,7 +23,8 @@ pub struct Application {
     waiting_for_downloads: bool,
     checking_integrity: Arc<AtomicBool>,
     correct_files: Arc<Mutex<Vec<FFileManifest>>>,
-    ignore_corrupted_files: bool
+    ignore_corrupted_files: bool,
+    manifest_communication: (tokio::sync::mpsc::Sender<ParseResult<FManifest>>, tokio::sync::mpsc::Receiver<ParseResult<FManifest>>),
 }
 
 impl Default for Application {
@@ -43,7 +44,8 @@ impl Default for Application {
             download_manager: Arc::new(Mutex::new(None)),
             waiting_for_downloads: false,
             checking_integrity: Arc::new(AtomicBool::new(false)),
-            correct_files: Arc::new(Mutex::new(Vec::new()))
+            correct_files: Arc::new(Mutex::new(Vec::new())),
+            manifest_communication: tokio::sync::mpsc::channel(1),
         }
     }
 }
@@ -94,6 +96,34 @@ impl Application {
 impl eframe::App for Application {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+
+        if let Ok(manifest_result) = self.manifest_communication.1.try_recv() {
+            match manifest_result {
+                Ok(manifest) => {
+                    self.manifest = Some(manifest);
+                    let mut tags = self.manifest.as_ref().unwrap().file_list.entries().iter().flat_map(|x| {
+                        x.install_tags()
+                    }).filter(|tag| !tag.contains("chunk")).map(|x| x.to_string()).collect::<Vec<String>>();
+
+                    tags.sort();
+                    tags.dedup();
+
+                    self.tags = Some(tags.clone());
+
+                    self.download_tags = HashMap::with_capacity(tags.len());
+
+                    
+                    for tag in tags {
+                        self.download_tags.insert(tag.clone(), true);
+                    }
+
+                    self.calculate_game_files_size();
+
+                },
+                Err(error) => self.error = Some(error.into()),
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(error) = &self.error {
                 ui.label(format!("Error: {}", error));
@@ -296,30 +326,51 @@ impl eframe::App for Application {
                         if ui.button("Select").clicked() {
                             if let Some(path) = rfd::FileDialog::new().pick_file() {
                                 let mut parser = epic_manifest_parser_rs::manifest::FManifestParser::new(&std::fs::read(path).unwrap());
+                                
+                                let tx =  self.manifest_communication.0.clone();
+                                tokio::spawn(async move {
+                                   let _ = tx.send(parser.parse()).await;
+                                });
+                            }
+                        }
+
+                        if ui.button("Use the latest manifest").clicked() {
+                            match crate::launcher::epic_get_remember_me_data() {
+                                Ok(mut remember_me_data ) => {
+
+                                    let tx: tokio::sync::mpsc::Sender<Result<FManifest, epic_manifest_parser_rs::error::ParseError>> = self.manifest_communication.0.clone();
+                                    tokio::spawn(async move {
+                                        if let Ok(launcher_token) = epic::token(
+                                            epic::Token::RefreshToken(&remember_me_data.token),
+                                            get_client!("launcherAppClient2"),
+                                        )
+                                        .await {
+                                            remember_me_data.token = launcher_token.refresh_token.clone().unwrap();
     
-                                match parser.parse() {
-                                    Ok(manifest) => {
-                                        self.manifest = Some(manifest);
-                                        let mut tags = self.manifest.as_ref().unwrap().file_list.entries().iter().flat_map(|x| {
-                                            x.install_tags()
-                                        }).filter(|tag| !tag.contains("chunk")).map(|x| x.to_string()).collect::<Vec<String>>();
-    
-                                        tags.sort();
-                                        tags.dedup();
-    
-                                        self.tags = Some(tags.clone());
-    
-                                        self.download_tags = HashMap::with_capacity(tags.len());
-    
-                                        
-                                        for tag in tags {
-                                            self.download_tags.insert(tag.clone(), true);
+                                            if let Err(e) = launcher::epic_set_remember_me_data(remember_me_data) {
+                                                eprintln!("Failed to save remember me data: {}", e);
+                                            }
+        
+                                            dbg!(&launcher_token.access_token);
+
+                                            if let Ok(manifest_response) = launcher_token.get_manifest().await {
+                                                if let Some(manifest_uri) = manifest_response.get_first_manifest() {
+                                                    if let Ok(response) = reqwest::get(&manifest_uri).await {
+                                                        let bytes = response.bytes().await.unwrap().to_vec();
+                                                        
+                                                        let mut parser = epic_manifest_parser_rs::manifest::FManifestParser::new(&bytes);
+                                                        let _ = tx.send(parser.parse()).await;
+                                                    }
+                                                }
+                                            }
+
+                                        } else {
+                                            eprintln!("Failed to login");
                                         }
-    
-                                        self.calculate_game_files_size();
-    
-                                    },
-                                    Err(error) => self.error = Some(error.into()),
+                                    });
+                                }, 
+                                Err(e) => {
+                                    eprintln!("Failed to get remember me data: {}", e);
                                 }
                             }
                         }
